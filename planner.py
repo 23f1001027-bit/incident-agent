@@ -2,13 +2,62 @@
 import json
 import os
 import re
+import threading
+import time
 
 import httpx
 
 LLM_URL = os.environ.get("LLM_URL", "https://aipipe.org/openai/v1/chat/completions")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4.1")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4.1-mini")
 TOKEN = os.environ.get("AIPIPE_TOKEN", "")
-CLIENT = httpx.Client(timeout=httpx.Timeout(15.0, connect=4.0))
+PLAN_BUDGET = float(os.environ.get("PLAN_BUDGET", "15.5"))        # seconds; grader allows 18 per request
+SEM = threading.BoundedSemaphore(int(os.environ.get("MAX_CONCURRENT", "4")))
+
+
+def providers():
+    out = [(LLM_URL, LLM_MODEL, TOKEN)]
+    if os.environ.get("LLM_URL_2"):
+        out.append((os.environ["LLM_URL_2"], os.environ.get("LLM_MODEL_2", LLM_MODEL),
+                    os.environ.get("LLM_TOKEN_2", TOKEN)))
+    return out
+
+
+def call_llm(messages):
+    """POST with retry on 429/5xx/timeouts inside a hard time budget. Returns (text, model_used)."""
+    deadline = time.monotonic() + PLAN_BUDGET
+    if not SEM.acquire(timeout=max(0.1, PLAN_BUDGET - 4)):
+        raise RuntimeError("too many concurrent planning calls")
+    try:
+        provs, attempt, last = providers(), 0, "no attempt"
+        while time.monotonic() < deadline - 1.0:
+            url, model, token = provs[attempt % len(provs)]
+            attempt += 1
+            try:
+                r = httpx.post(url, headers={"Authorization": f"Bearer {token}"},
+                               json={"model": model, "temperature": 0, "response_format": {"type": "json_object"},
+                                     "messages": messages},
+                               timeout=max(3.0, deadline - time.monotonic()))
+            except httpx.HTTPError as exc:
+                last = repr(exc)
+                print(f"LLM attempt {attempt} error: {last}", flush=True)
+                continue
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]["content"], model
+            last = f"HTTP {r.status_code}"
+            print(f"LLM attempt {attempt} {model} -> HTTP {r.status_code}: {r.text[:300]}", flush=True)
+            if r.status_code in (408, 409, 429, 500, 502, 503, 504):
+                try:
+                    wait = min(max(float(r.headers.get("retry-after", 1.5)), 0.2), 3.0)
+                except ValueError:
+                    wait = 1.5
+                if deadline - time.monotonic() - wait < 2.5:      # no time for another real attempt
+                    break
+                time.sleep(wait)
+                continue
+            break                                           # other 4xx: retrying won't help
+        raise RuntimeError(f"model call failed: {last}")
+    finally:
+        SEM.release()
 
 SYSTEM = """You are a senior site-reliability engineer triaging one incident. Work only from the evidence.
 
@@ -39,16 +88,5 @@ def planner(body, hint=None):
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]
     if hint:
         messages.append({"role": "user", "content": "Your previous answer was rejected: " + hint + " Return a corrected JSON plan."})
-    r = CLIENT.post(
-        LLM_URL,
-        headers={"Authorization": f"Bearer {TOKEN}"},
-        json={
-            "model": LLM_MODEL,
-            "temperature": 0,
-            "response_format": {"type": "json_object"},
-            "messages": messages,
-        },
-    )
-    r.raise_for_status()
-    text = r.json()["choices"][0]["message"]["content"]
-    return json.loads(re.search(r"\{.*\}", text, re.S).group(0)), LLM_MODEL
+    text, model_used = call_llm(messages)
+    return json.loads(re.search(r"\{.*\}", text, re.S).group(0)), model_used
