@@ -126,6 +126,18 @@ def error(status, code, message="Request rejected."):
 
 
 # ---------------------------------------------------------------- plan validation
+def type_ok(t, v):
+    if t is None:
+        return True
+    if isinstance(t, list):
+        return any(type_ok(x, v) for x in t)
+    return ((t == "string" and isinstance(v, str)) or
+            (t == "integer" and isinstance(v, int) and not isinstance(v, bool)) or
+            (t == "number" and isinstance(v, (int, float)) and not isinstance(v, bool)) or
+            (t == "boolean" and isinstance(v, bool)) or (t == "array" and isinstance(v, list)) or
+            (t == "object" and isinstance(v, dict)) or (t == "null" and v is None))
+
+
 def check_schema(args, schema):
     if not isinstance(args, dict):
         return None
@@ -133,18 +145,20 @@ def check_schema(args, schema):
     props = schema.get("properties") or {}
     out = {}
     for k, v in args.items():
-        if props and k not in props:
-            if schema.get("additionalProperties") is False:
-                continue
+        if props and k not in props and schema.get("additionalProperties") is False:
+            continue
         spec = props.get(k) or {}
-        t = spec.get("type")
-        ok = (t is None or (t == "string" and isinstance(v, str)) or
-              (t == "integer" and isinstance(v, int) and not isinstance(v, bool)) or
-              (t == "number" and isinstance(v, (int, float)) and not isinstance(v, bool)) or
-              (t == "boolean" and isinstance(v, bool)) or (t == "array" and isinstance(v, list)) or
-              (t == "object" and isinstance(v, dict)))
-        if not ok:
-            return None
+        if not type_ok(spec.get("type"), v):
+            # tolerate numbers sent as strings, and the reverse
+            if spec.get("type") in ("integer", "number") and isinstance(v, str):
+                try:
+                    v = int(v) if spec["type"] == "integer" else float(v)
+                except ValueError:
+                    return None
+            elif spec.get("type") == "string" and isinstance(v, (int, float)) and not isinstance(v, bool):
+                v = str(v)
+            else:
+                return None
         if "enum" in spec and v not in spec["enum"]:
             return None
         out[k] = v
@@ -159,26 +173,26 @@ def ev_ids(transcript):
 
 
 def validate_plan(raw, body):
-    """Returns a clean plan dict, or None when the model output is unusable."""
+    """Returns (plan, None) or (None, reason)."""
     try:
         inc, pol = body["incident"], body["policy"]
         known = set(ev_ids(inc["transcript"]))
-        if raw["rootCause"] not in inc["allowedRootCauses"]:
-            return None
+        if raw.get("rootCause") not in inc["allowedRootCauses"]:
+            return None, f"rootCause {raw.get('rootCause')!r} is not one of allowedRootCauses {inc['allowedRootCauses']}"
         ev = []
-        for e in raw["evidence"]:
+        for e in raw.get("evidence") or []:
             e = str(e).strip().strip("[]")
             if e in known and e not in ev:
                 ev.append(e)
         ev = ev[:4]
         if len(ev) < 2:
-            return None
+            return None, "evidence must contain 2 to 4 IDs that appear at the start of transcript lines"
         catalog = {t["name"]: t for t in body["toolCatalog"]}
         effect_tools = set(pol.get("effectTools") or [])
         limit = max(1, min(3, int(pol.get("maximumDiagnostics", 3))))
         diags, seen = [], set()
-        for d in raw["diagnostics"]:
-            name = d["toolName"]
+        for d in raw.get("diagnostics") or []:
+            name = d.get("toolName")
             if name not in catalog or name in effect_tools:
                 continue
             args = check_schema(d.get("arguments", {}), catalog[name].get("inputSchema"))
@@ -192,18 +206,18 @@ def validate_plan(raw, body):
             diags.append({"toolName": name, "arguments": args, "evidence": cite})
         diags = diags[:limit]
         if not diags:
-            return None
-        eff = raw["effect"]
-        if eff["toolName"] not in effect_tools or eff["toolName"] not in catalog:
-            return None
+            return None, "no valid diagnostic call: use catalog tools that are not effect tools, with arguments matching inputSchema"
+        eff = raw.get("effect") or {}
+        if eff.get("toolName") not in effect_tools or eff.get("toolName") not in catalog:
+            return None, f"effect.toolName must be one of {sorted(effect_tools)}"
         eargs = check_schema(eff.get("arguments", {}), catalog[eff["toolName"]].get("inputSchema"))
         if eargs is None:
-            return None
+            return None, "effect.arguments do not match the tool inputSchema"
         ecite = [e for e in dict.fromkeys(str(x).strip("[] ") for x in eff.get("evidence") or []) if e in ev] or ev[:1]
         return {"rootCause": raw["rootCause"], "evidence": ev, "diagnostics": diags,
-                "effect": {"toolName": eff["toolName"], "arguments": eargs, "evidence": ecite}}
-    except Exception:
-        return None
+                "effect": {"toolName": eff["toolName"], "arguments": eargs, "evidence": ecite}}, None
+    except Exception as exc:
+        return None, f"malformed plan ({type(exc).__name__})"
 
 
 def fallback_plan(body):
@@ -225,6 +239,25 @@ def fallback_plan(body):
     return {"rootCause": inc["allowedRootCauses"][0], "evidence": ev,
             "diagnostics": [{"toolName": diag_name, "arguments": fill(catalog[diag_name].get("inputSchema")), "evidence": ev[:1]}],
             "effect": {"toolName": eff, "arguments": fill(catalog[eff].get("inputSchema")), "evidence": ev[:1]}}
+
+
+_sample_logged = {"n": 0}
+
+
+def log_sample(body):
+    """First two incidents: print the structure (not the sensitive object) so prompts can be tuned."""
+    if _sample_logged["n"] >= 2:
+        return
+    _sample_logged["n"] += 1
+    inc, pol = body["incident"], body["policy"]
+    lines = inc["transcript"].split("\n")
+    print("SAMPLE INCIDENT:", json.dumps({
+        "title": inc.get("title"), "service": inc.get("service"), "severity": inc.get("severity"),
+        "allowedRootCauses": inc["allowedRootCauses"], "transcriptLines": len(lines),
+        "firstLines": lines[:6],
+        "tools": [{"name": t["name"], "schema": t.get("inputSchema")} for t in body["toolCatalog"]],
+        "policy": {k: pol.get(k) for k in ("maximumDiagnostics", "effectTools", "approvalRequiredFor")},
+    }, ensure_ascii=False)[:5000], flush=True)
 
 
 # ---------------------------------------------------------------- dispatch / views
@@ -291,22 +324,38 @@ def create_run(body, headers, planner):
         if ts:
             trace["tracestate"] = ts
 
+    log_sample(body)
     plan_start = time.time_ns()
-    raw, model = None, os.environ.get("LLM_MODEL", "gpt-4.1-mini")
+    raw, model = None, os.environ.get("LLM_MODEL", "gpt-4.1")
+    reason, t_first = "planner failed", time.time()
     try:
         raw, model = planner(body)
     except Exception as exc:
         print("planner error:", repr(exc), flush=True)
+    plan = None
+    if raw:
+        plan, reason = validate_plan(raw, body)
+        if plan is None and time.time() - t_first < 7:          # one corrective retry, same logical chat step
+            try:
+                raw2, model = planner(body, reason)
+                plan, reason = validate_plan(raw2, body)
+                raw = raw2
+            except Exception as exc:
+                print("planner retry error:", repr(exc), flush=True)
     plan_end = time.time_ns()
-    plan = validate_plan(raw, body) if raw else None
-    if plan is None:
-        print("plan invalid -> fallback", flush=True)
+    used_fallback = plan is None
+    if used_fallback:
+        print(f"RUN {run_id[:14]} FALLBACK plan used. reason: {reason}", flush=True)
+        if raw:
+            print("RUN raw model plan:", json.dumps(raw, ensure_ascii=False)[:1500], flush=True)
         plan = fallback_plan(body)
     if plan is None:
         return error(422, "PLAN_UNAVAILABLE")
-
     secrets_list = sensitive_values(body)
-    plan = scrub(plan, secrets_list)
+    plan = scrub(plan, secrets_list)                 # scrub BEFORE anything is logged or stored
+    print(f"RUN {run_id[:14]} plan={'FALLBACK' if used_fallback else 'model'} rootCause={plan['rootCause']} "
+          f"evidence={plan['evidence']} diagnostics={[(d['toolName'], d['arguments']) for d in plan['diagnostics']]} "
+          f"effect=({plan['effect']['toolName']}, {plan['effect']['arguments']})", flush=True)
 
     state = {
         "runId": run_id, "status": "waiting", "reqHash": sha(canon(body)),
