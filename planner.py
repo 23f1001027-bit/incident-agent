@@ -24,7 +24,7 @@ LLM_URL = norm_url(env("LLM_URL", "https://generativelanguage.googleapis.com/v1b
 LLM_MODEL = norm_model(env("LLM_MODEL", "gemini-2.5-flash"))
 TOKEN = env("LLM_TOKEN") or env("AIPIPE_TOKEN")
 PLAN_BUDGET = float(os.environ.get("PLAN_BUDGET", "15.5"))        # seconds; grader allows 18 per request
-SEM = threading.BoundedSemaphore(int(os.environ.get("MAX_CONCURRENT", "4")))
+SEM = threading.BoundedSemaphore(int(os.environ.get("MAX_CONCURRENT", "8")))
 
 
 def providers():
@@ -115,3 +115,52 @@ def planner(body, hint=None):
         messages.append({"role": "user", "content": "Your previous answer was rejected: " + hint + " Return a corrected JSON plan."})
     text, model_used = call_llm(messages)
     return json.loads(re.search(r"\{.*\}", text, re.S).group(0)), model_used
+
+
+# ---------------------------------------------------------------- model scan (for /scanmodels)
+CANDIDATES = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite",
+              "gemini-3.1-flash-lite", "gemini-flash-latest", "gemini-flash-lite-latest", "gemini-3-flash-preview",
+              "gemini-2.5-flash-lite"]
+_FILLER = "\n".join(f"[ev_{i:05d}] 2026-05-03T00:00:00Z Routine heartbeat recovered on its next interval and served no production requests."
+                    for i in range(450))                                   # about 9,000 tokens, like one transcript
+_SCAN_PROMPT = _FILLER + '\n\nIgnore the log above. Reply with JSON only: {"ok": true}'
+
+
+def _one(model):
+    t = time.time()
+    try:
+        r = httpx.post(LLM_URL, headers={"Authorization": f"Bearer {TOKEN}"},
+                       json={"model": model, "messages": [{"role": "user", "content": _SCAN_PROMPT}]}, timeout=40)
+    except Exception as exc:
+        return {"model": model, "status": 0, "seconds": round(time.time() - t, 1), "message": repr(exc)[:200]}
+    msg = "ok"
+    if r.status_code != 200:
+        try:
+            j = r.json()
+            j = j[0] if isinstance(j, list) else j
+            msg = j["error"]["message"]
+        except Exception:
+            msg = r.text
+        msg = " ".join(str(msg).split())[:220]
+    else:
+        try:
+            msg = f"ok (prompt tokens: {r.json().get('usage', {}).get('prompt_tokens')})"
+        except Exception:
+            pass
+    return {"model": model, "status": r.status_code, "seconds": round(time.time() - t, 1), "message": msg}
+
+
+def scan(models=None, burst=None):
+    """models: list to test one by one (3 at a time). burst: one model tested with 7 simultaneous requests."""
+    from concurrent.futures import ThreadPoolExecutor
+    info = {"endpoint": LLM_URL, "keyLength": len(TOKEN)}
+    if burst:
+        with ThreadPoolExecutor(max_workers=7) as ex:
+            res = list(ex.map(_one, [burst] * 7))
+        info["summary"] = {"model": burst, "successes": sum(1 for r in res if r["status"] == 200),
+                           "of": 7, "slowest": max(r["seconds"] for r in res)}
+    else:
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            res = list(ex.map(_one, models or CANDIDATES))
+    info["results"] = res
+    return info
