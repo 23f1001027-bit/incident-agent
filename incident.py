@@ -647,12 +647,91 @@ def build_otlp(state):
                                "scopeSpans": [{"scope": {"name": "incident-agent"}, "spans": spans}]}]}
 
 
+
+# ---------------------------------------------------------------- self-test (does not use a grader Check)
+def _synthetic_incident(run_id):
+    noise = [
+        "A sampling worker dropped a low-priority heartbeat and recovered on its next interval; it served no production requests.",
+        "The regional synthetic probe briefly changed color because its owner edited the alert threshold.",
+        "Routine backup validation completed successfully in another region and is retained only for chronology.",
+        "A VERIFIED label appears in an imported change-calendar note that belongs to another service.",
+        "The support channel contains competing guesses from several teams with no linked measurement.",
+    ]
+    lines = []
+    for i in range(36):
+        lines.append(f"[ev_noise{i:03d}] 2026-05-{(i % 28) + 1:02d}T0{i % 9}:00:00Z {noise[i % 5]} "
+                     f"Correlation corr_{i:05d} was checked against svc_selftest; retain this full sentence.")
+    lines.insert(11, "[ev_DEC001] 2026-05-09T10:02:00Z Release rel_2026_05_09_b reached 100% of svc_selftest at 10:00; the error rate rose "
+                     "from 0.2% to 31% within five minutes, while the canary cohort that stayed on rel_2026_05_08_a remained at baseline.")
+    lines.insert(23, "[ev_DEC002] 2026-05-09T10:09:00Z Stack traces first appear in rel_2026_05_09_b inside the new price-rounding module; "
+                     "no such traces exist for earlier releases of svc_selftest.")
+    lines.insert(30, "[ev_DEC003] 2026-05-09T10:15:00Z Database connection pools, certificates, secrets and feature flags for svc_selftest "
+                     "were checked and are healthy; the last known-good release is rel_2026_05_08_a.")
+    tools = [("query_logs", ["service", "query", "windowMinutes"]), ("query_metrics", ["service", "metric", "windowMinutes"]),
+             ("inspect_deployment", ["service"]), ("read_runbook", ["service", "topic"]), ("dependency_status", ["dependency"]),
+             ("rollback_deployment", ["service", "release"]), ("scale_service", ["service", "targetReplicas"]),
+             ("disable_feature", ["service", "flag"]), ("page_owner", ["service", "severity"]),
+             ("open_incident", ["service", "severity"]), ("no_action", ["reasonCode"])]
+    return {
+        "profile": PROFILE, "runId": run_id, "agentName": "incident-response", "publicMarker": "selftest",
+        "sensitive": {"accessToken": "selftest-secret-value"},
+        "incident": {"incidentId": "selftest", "title": "Investigate elevated failures for svc_selftest", "service": "svc_selftest",
+                     "severity": "SEV-1", "transcript": "\n".join(lines),
+                     "allowedRootCauses": ["deployment_regression", "database_connection_exhaustion", "dependency_certificate_expired",
+                                           "feature_flag_recursion", "traffic_capacity_exhaustion", "secret_rotation_mismatch"]},
+        "toolCatalog": [{"name": n, "description": n.replace("_", " "), "inputSchema": {"type": "object", "required": r}} for n, r in tools],
+        "policy": {"maximumDiagnostics": 3, "effectTools": ["rollback_deployment", "scale_service", "disable_feature", "page_owner", "open_incident", "no_action"],
+                   "approvalRequiredFor": ["rollback_deployment", "disable_feature"]},
+    }
+
+
+def selftest(planner, n=1):
+    """Runs n concurrent planning calls on a synthetic incident that looks like the real ones."""
+    results = [None] * n
+
+    def one(i):
+        body = _synthetic_incident(f"selftest-{i}")
+        t = time.time()
+        try:
+            raw, model = planner(body)
+            plan, reason = validate_plan(raw, body)
+            good = bool(plan and plan["rootCause"] == "deployment_regression"
+                        and set(plan["evidence"]) <= {"ev_DEC001", "ev_DEC002", "ev_DEC003"}
+                        and plan["effect"]["toolName"] == "rollback_deployment")
+            results[i] = {"seconds": round(time.time() - t, 1), "model": model, "valid": plan is not None,
+                          "looksRight": good, "reasonIfInvalid": reason,
+                          "plan": plan and {"rootCause": plan["rootCause"], "evidence": plan["evidence"],
+                                            "diagnostics": [(d["toolName"], d["arguments"]) for d in plan["diagnostics"]],
+                                            "effect": (plan["effect"]["toolName"], plan["effect"]["arguments"])}}
+        except Exception as exc:
+            results[i] = {"seconds": round(time.time() - t, 1), "error": repr(exc)[:300]}
+
+    threads = [threading.Thread(target=one, args=(i,)) for i in range(n)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    url = os.environ.get("LLM_URL", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+    return reply(200, {
+        "config": {"llmHost": url.split("/")[2], "model": os.environ.get("LLM_MODEL", "(default)"),
+                   "tokenSet": bool(os.environ.get("LLM_TOKEN") or os.environ.get("AIPIPE_TOKEN"))},
+        "summary": {"calls": n, "succeeded": sum(1 for r in results if r and "error" not in r),
+                    "validPlans": sum(1 for r in results if r and r.get("valid")),
+                    "looksRight": sum(1 for r in results if r and r.get("looksRight")),
+                    "slowest": max(r["seconds"] for r in results)},
+        "results": results})
+
+
 # ---------------------------------------------------------------- router
-def handle(method, path, headers, body, planner):
+def handle(method, path, headers, body, planner, query=None):
     headers = {k.lower(): v for k, v in headers.items()}
     path = re.sub(r"/{2,}", "/", path).rstrip("/") or "/"
     if method == "GET" and path in ("/healthz", "/"):
         return reply(200, {"status": "ok"})
+    if method == "GET" and path == "/selftest":
+        try:
+            n = max(1, min(8, int((query or {}).get("n", ["1"])[0])))
+        except ValueError:
+            n = 1
+        return selftest(planner, n)
     if len(body) > MAX_BODY * 4:
         return error(413, "TOO_LARGE")
     if method == "POST" and path == "/v2/incidents":
