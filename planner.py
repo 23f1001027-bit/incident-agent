@@ -7,9 +7,9 @@ import time
 
 import httpx
 
-LLM_URL = os.environ.get("LLM_URL", "https://aipipe.org/openai/v1/chat/completions")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4.1-mini")
-TOKEN = os.environ.get("AIPIPE_TOKEN", "")
+LLM_URL = os.environ.get("LLM_URL", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash")
+TOKEN = os.environ.get("LLM_TOKEN") or os.environ.get("AIPIPE_TOKEN", "")
 PLAN_BUDGET = float(os.environ.get("PLAN_BUDGET", "15.5"))        # seconds; grader allows 18 per request
 SEM = threading.BoundedSemaphore(int(os.environ.get("MAX_CONCURRENT", "4")))
 
@@ -28,14 +28,17 @@ def call_llm(messages):
     if not SEM.acquire(timeout=max(0.1, PLAN_BUDGET - 4)):
         raise RuntimeError("too many concurrent planning calls")
     try:
-        provs, attempt, last = providers(), 0, "no attempt"
+        provs, attempt, last, json_mode, extras = providers(), 0, "no attempt", {}, {}
         while time.monotonic() < deadline - 1.0:
             url, model, token = provs[attempt % len(provs)]
             attempt += 1
+            payload = {"model": model, "temperature": 0, "messages": messages}
+            if json_mode.get(url, os.environ.get("JSON_MODE", "1") == "1"):
+                payload["response_format"] = {"type": "json_object"}
+            if os.environ.get("REASONING_EFFORT") and extras.get(url, True):
+                payload["reasoning_effort"] = os.environ["REASONING_EFFORT"]
             try:
-                r = httpx.post(url, headers={"Authorization": f"Bearer {token}"},
-                               json={"model": model, "temperature": 0, "response_format": {"type": "json_object"},
-                                     "messages": messages},
+                r = httpx.post(url, headers={"Authorization": f"Bearer {token}"}, json=payload,
                                timeout=max(3.0, deadline - time.monotonic()))
             except httpx.HTTPError as exc:
                 last = repr(exc)
@@ -45,6 +48,12 @@ def call_llm(messages):
                 return r.json()["choices"][0]["message"]["content"], model
             last = f"HTTP {r.status_code}"
             print(f"LLM attempt {attempt} {model} -> HTTP {r.status_code}: {r.text[:300]}", flush=True)
+            if r.status_code == 400 and "response_format" in payload:
+                json_mode[url] = False                      # provider rejects JSON mode: retry without it
+                continue
+            if r.status_code == 400 and "reasoning_effort" in payload:
+                extras[url] = False                         # provider rejects reasoning_effort: retry without it
+                continue
             if r.status_code in (408, 409, 429, 500, 502, 503, 504):
                 try:
                     wait = min(max(float(r.headers.get("retry-after", 1.5)), 0.2), 3.0)
@@ -69,6 +78,10 @@ Do this:
 2. evidence: cite 2 to 4 distinct evidence IDs (without brackets) that actually establish that root cause: the lines that directly state or prove it for THIS service and THIS incident. Lines can describe other services, other regions, older incidents, rumours or hypothetical/training scenarios; do not cite those. Prefer the fewest decisive lines.
 3. diagnostics: choose the FEWEST diagnostic calls (1 to 3, never more than policy.maximumDiagnostics) that confirm the root cause. Use only catalog tools that are NOT in policy.effectTools. Independent checks may be listed together. Every call needs exact, incident-specific arguments that follow the tool's inputSchema (service name, deployment/version, region, time window and so on, taken from the transcript). Do not add calls that are not needed. Each diagnostic cites at least one of your evidence IDs.
 4. effect: choose exactly ONE tool from policy.effectTools that is justified by the root cause, with exact arguments from the transcript (the precise deployment version, feature flag or service the evidence points to; a wrong target is penalised). If the service is ALREADY AT its permitted scaling limit (for example current replicas equal the maximum allowed), do NOT scale: page the owner instead. rollback_deployment and disable_feature are destructive; choose them only when the evidence clearly shows a bad deployment or a bad feature flag, and name the exact target. Approval is handled by the system, so you simply choose the tool.
+
+Argument rules: tool schemas list only the REQUIRED argument names, so infer sensible types: names ending in Minutes or Replicas are integers (for example windowMinutes 15, targetReplicas 6); service is the incident's service ID exactly as written; severity is the incident severity exactly as written (for example SEV-1); release, flag, metric, query, topic and dependency come from the transcript evidence (the exact release ID, flag name, metric name or dependency name the evidence mentions). Never leave a required argument empty or invent a name that does not appear in the transcript.
+
+Typical effects (the transcript's own runbook or policy evidence overrides this): deployment_regression -> rollback_deployment to the previous known-good release named in the evidence; feature_flag_recursion -> disable_feature with the flag named in the evidence; database_connection_exhaustion or traffic_capacity_exhaustion -> scale_service within the stated permitted limit, but page_owner if the service is already at that limit; dependency_certificate_expired or secret_rotation_mismatch -> follow the runbook lines in the transcript. Use no_action only when the evidence shows the problem is benign or already resolved.
 
 Reply with JSON only (no markdown):
 {"rootCause":"...","evidence":["ev_..","ev_.."],
