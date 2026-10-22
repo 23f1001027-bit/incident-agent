@@ -7,18 +7,30 @@ import time
 
 import httpx
 
-LLM_URL = os.environ.get("LLM_URL", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash")
-TOKEN = os.environ.get("LLM_TOKEN") or os.environ.get("AIPIPE_TOKEN", "")
+def env(name, default=""):
+    return (os.environ.get(name) or default).strip().strip("\"'").strip()
+
+
+def norm_url(u):
+    u = u.rstrip("/")
+    return u if u.endswith("chat/completions") else u + "/chat/completions"
+
+
+def norm_model(m):
+    return m[len("models/"):] if m.startswith("models/") else m
+
+
+LLM_URL = norm_url(env("LLM_URL", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"))
+LLM_MODEL = norm_model(env("LLM_MODEL", "gemini-2.5-flash"))
+TOKEN = env("LLM_TOKEN") or env("AIPIPE_TOKEN")
 PLAN_BUDGET = float(os.environ.get("PLAN_BUDGET", "15.5"))        # seconds; grader allows 18 per request
 SEM = threading.BoundedSemaphore(int(os.environ.get("MAX_CONCURRENT", "4")))
 
 
 def providers():
     out = [(LLM_URL, LLM_MODEL, TOKEN)]
-    if os.environ.get("LLM_URL_2"):
-        out.append((os.environ["LLM_URL_2"], os.environ.get("LLM_MODEL_2", LLM_MODEL),
-                    os.environ.get("LLM_TOKEN_2", TOKEN)))
+    if env("LLM_URL_2"):
+        out.append((norm_url(env("LLM_URL_2")), norm_model(env("LLM_MODEL_2", LLM_MODEL)), env("LLM_TOKEN_2") or TOKEN))
     return out
 
 
@@ -46,7 +58,7 @@ def call_llm(messages):
                 continue
             if r.status_code == 200:
                 return r.json()["choices"][0]["message"]["content"], model
-            last = f"HTTP {r.status_code}"
+            last = f"HTTP {r.status_code}: {r.text[:200]}"
             print(f"LLM attempt {attempt} {model} -> HTTP {r.status_code}: {r.text[:300]}", flush=True)
             if r.status_code == 400 and "response_format" in payload:
                 json_mode[url] = False                      # provider rejects JSON mode: retry without it

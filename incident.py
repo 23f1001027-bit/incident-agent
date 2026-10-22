@@ -704,14 +704,17 @@ def selftest(planner, n=1):
                                             "diagnostics": [(d["toolName"], d["arguments"]) for d in plan["diagnostics"]],
                                             "effect": (plan["effect"]["toolName"], plan["effect"]["arguments"])}}
         except Exception as exc:
-            results[i] = {"seconds": round(time.time() - t, 1), "error": repr(exc)[:300]}
+            results[i] = {"seconds": round(time.time() - t, 1), "error": repr(exc)[:500]}
 
     threads = [threading.Thread(target=one, args=(i,)) for i in range(n)]
     [t.start() for t in threads]
     [t.join() for t in threads]
     url = os.environ.get("LLM_URL", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
     return reply(200, {
-        "config": {"llmHost": url.split("/")[2], "model": os.environ.get("LLM_MODEL", "(default)"),
+        "config": {"llmHost": url.split("/")[2], "llmPath": "/" + "/".join(url.split("/")[3:]),
+                   "model": os.environ.get("LLM_MODEL", "(default)"),
+                   "effectiveUrl": getattr(__import__("planner"), "LLM_URL", None) if "planner" in __import__("sys").modules else None,
+                   "effectiveModel": getattr(__import__("planner"), "LLM_MODEL", None) if "planner" in __import__("sys").modules else None,
                    "tokenSet": bool(os.environ.get("LLM_TOKEN") or os.environ.get("AIPIPE_TOKEN"))},
         "summary": {"calls": n, "succeeded": sum(1 for r in results if r and "error" not in r),
                     "validPlans": sum(1 for r in results if r and r.get("valid")),
