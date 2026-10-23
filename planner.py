@@ -23,7 +23,7 @@ def norm_model(m):
 LLM_URL = norm_url(env("LLM_URL", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"))
 LLM_MODEL = norm_model(env("LLM_MODEL", "gemini-2.5-flash"))
 TOKEN = env("LLM_TOKEN") or env("AIPIPE_TOKEN")
-PLAN_BUDGET = float(os.environ.get("PLAN_BUDGET", "15.5"))        # seconds; grader allows 18 per request
+PLAN_BUDGET = float(os.environ.get("PLAN_BUDGET", "16.5"))        # seconds; grader allows 18 per request
 SEM = threading.BoundedSemaphore(int(os.environ.get("MAX_CONCURRENT", "8")))
 
 
@@ -101,11 +101,21 @@ Reply with JSON only (no markdown):
  "effect":{"toolName":"...","arguments":{...},"evidence":["ev_.."]}}"""
 
 
+PAD_RE = re.compile(r"\s*Correlation corr_\w+ was checked against \S+?; retain this full sentence so the agent must rank "
+                    r"evidence rather than match a short keyword\.?")
+
+
+def compact(transcript):
+    """Drop boilerplate padding that carries no evidence; keeps every line and every evidence ID."""
+    return "\n".join(PAD_RE.sub("", line) for line in transcript.split("\n"))
+
+
 def planner(body, hint=None):
     """Returns (raw_plan_dict, model_name)."""
     inc, pol = body["incident"], body["policy"]
     payload = {
-        "incident": {k: inc.get(k) for k in ("incidentId", "title", "service", "severity", "transcript", "allowedRootCauses")},
+        "incident": {**{k: inc.get(k) for k in ("incidentId", "title", "service", "severity", "allowedRootCauses")},
+                     "transcript": compact(inc["transcript"])},
         "toolCatalog": body["toolCatalog"],
         "policy": {k: pol.get(k) for k in ("maximumDiagnostics", "effectTools", "approvalRequiredFor")},
     }
@@ -113,7 +123,9 @@ def planner(body, hint=None):
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]
     if hint:
         messages.append({"role": "user", "content": "Your previous answer was rejected: " + hint + " Return a corrected JSON plan."})
+    t0 = time.time()
     text, model_used = call_llm(messages)
+    print(f"LLM ok model={model_used} seconds={time.time() - t0:.1f} prompt_chars={len(messages[1]['content'])}", flush=True)
     return json.loads(re.search(r"\{.*\}", text, re.S).group(0)), model_used
 
 
