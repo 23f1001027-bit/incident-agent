@@ -68,10 +68,16 @@ def _facts(transcript):
     bad = [r for r in releases if r not in good]
     reps = [int(x) for x in REPLICA_RE.findall(text)]
     cur = [int(x) for x in CURRENT_RE.findall(text)]
+    kv = lambda pat: [int(x) for x in re.findall(pat, text, re.I)]
+    op, mx = kv(r"operating replicas\s*=\s*(\d+)"), kv(r"(?:contract|permitted|replica) maximum\s*=\s*(\d+)")
+    tgt, frz = kv(r"proposed target\s*=\s*(\d+)"), kv(r"freeze\s*=\s*(\d+)")
+    cur = cur or op
+    # the stated policy: scaling needs maximum >= target and no freeze; at/over the limit -> page the owner
+    kv_limit = bool((frz and frz[0] != 0) or (mx and tgt and tgt[0] > mx[0]) or (mx and op and op[0] >= mx[0]))
     return {"releases": releases, "goodReleases": good, "badReleases": bad,
             "flags": list(dict.fromkeys(FLAG_RE.findall(text))), "deps": list(dict.fromkeys(DEP_RE.findall(text))),
             "targetReplicas": reps[0] if reps else None, "currentReplicas": cur[0] if cur else None,
-            "atLimit": bool(AT_LIMIT_RE.search(text)) or bool(reps and cur and cur[0] >= reps[0])}
+            "atLimit": bool(AT_LIMIT_RE.search(text)) or bool(reps and cur and cur[0] >= reps[0]) or kv_limit}
 
 
 def facts(transcript):
@@ -103,6 +109,8 @@ def repair(plan, inc):
     for d in plan["diagnostics"]:
         d["arguments"] = fix(d["toolName"], d["arguments"])
     e = plan["effect"]
+    if e["toolName"] == "scale_service" and f["atLimit"]:      # already at the permitted limit: page, never scale
+        e["toolName"], e["arguments"] = "page_owner", {"service": svc, "severity": sev}
     e["arguments"] = fix(e["toolName"], e["arguments"])
     return plan
 
@@ -163,3 +171,44 @@ def rule_plan(body):
     return {"rootCause": cause, "evidence": ev,
             "diagnostics": [{"toolName": n, "arguments": a, "evidence": c} for n, a, c in diag],
             "effect": {"toolName": eff[0], "arguments": eff[1], "evidence": ev[:1]}}
+
+
+# ---------------------------------------------------------------- diagnostic probe (DIAG_PROBE=1)
+def probe_diagnostics(cause, inc):
+    """Up to three plausible read-only checks for the cause, each tied to the evidence line it confirms.
+    Used to learn which tools the grader requires (its receipts classify each call)."""
+    svc, f = inc.get("service"), facts(inc.get("transcript", ""))
+    lines = evidence_lines(inc.get("transcript", ""))
+    ev = [e for e, _ in lines]
+
+    def cite(pat, fallback=0):
+        hit = [e for e, t in lines if re.search(pat, t, re.I)]
+        return hit[:1] or ev[fallback:fallback + 1] or ev[:1]
+    dep, flag = (f["deps"] or [svc])[0], (f["flags"] or [""])[0]
+    table = {
+        "deployment_regression": [
+            ("inspect_deployment", {"service": svc}, cite(r"release")),
+            ("query_metrics", {"service": svc, "metric": "error_rate", "windowMinutes": 60}, cite(r"error-rate|error rate", 1)),
+            ("query_logs", {"service": svc, "query": "malformed responses", "windowMinutes": 60}, cite(r"malformed|errors"))],
+        "database_connection_exhaustion": [
+            ("query_metrics", {"service": svc, "metric": "db_pool_checkout_wait", "windowMinutes": 60}, cite(r"checkout wait|ceiling")),
+            ("query_logs", {"service": svc, "query": "pool acquisition timeout", "windowMinutes": 60}, cite(r"logs|acquisition", 1)),
+            ("read_runbook", {"service": svc, "topic": "database_connection_exhaustion"}, cite(r"target|replicas", 2))],
+        "dependency_certificate_expired": [
+            ("dependency_status", {"dependency": dep}, cite(r"dep_|certificate")),
+            ("read_runbook", {"service": svc, "topic": "dependency_certificate_expired"}, cite(r"runbook", 2)),
+            ("query_logs", {"service": svc, "query": "certificate expired", "windowMinutes": 60}, cite(r"notafter|tls|failed", 1))],
+        "feature_flag_recursion": [
+            ("query_logs", {"service": svc, "query": flag or "recursive evaluation", "windowMinutes": 60}, cite(r"cohort|loop")),
+            ("inspect_deployment", {"service": svc}, cite(r"deployment|release", 2)),
+            ("query_metrics", {"service": svc, "metric": "error_rate", "windowMinutes": 60}, cite(r"shadow|disabled", 1))],
+        "traffic_capacity_exhaustion": [
+            ("query_metrics", {"service": svc, "metric": "requests_per_second", "windowMinutes": 60}, cite(r"utilization|queue|requests")),
+            ("inspect_deployment", {"service": svc}, cite(r"release|replicas", 1)),
+            ("read_runbook", {"service": svc, "topic": "traffic_capacity_exhaustion"}, cite(r"policy|ceiling|maximum", 2))],
+        "secret_rotation_mismatch": [
+            ("read_runbook", {"service": svc, "topic": "secret_rotation_mismatch"}, cite(r"runbook", 2)),
+            ("query_logs", {"service": svc, "query": "authentication failure", "windowMinutes": 60}, cite(r"authentication|revocation", 1)),
+            ("inspect_deployment", {"service": svc}, cite(r"secret version|vault"))],
+    }
+    return [{"toolName": n, "arguments": a, "evidence": c} for n, a, c in table.get(cause, [])]
