@@ -81,9 +81,32 @@ def note_usage(model, tokens):
 
 
 # ---------------------------------------------------------------- one HTTP call
+GOOGLE_HOST = "generativelanguage.googleapis.com"
+NATIVE_GEMMA = env("NATIVE_GEMMA", "1") == "1"
+
+
+def call_native(model, messages, deadline):
+    """Google's native generateContent API. Gemma 4 returns HTTP 500 through the OpenAI-compatible adapter."""
+    text = "\n\n".join(m["content"] for m in messages)
+    body = {"contents": [{"role": "user", "parts": [{"text": text}]}],
+            "generationConfig": {"temperature": 0, "maxOutputTokens": 1024}}
+    url = f"https://{GOOGLE_HOST}/v1beta/models/{model}:generateContent"
+    r = httpx.post(url, headers={"x-goog-api-key": TOKEN}, json=body, timeout=max(1.0, deadline - time.monotonic()))
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code} (native): {' '.join(r.text[:300].split())}")
+    cands = r.json().get("candidates") or []
+    parts = (cands[0].get("content") or {}).get("parts") or [] if cands else []
+    out = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and not p.get("thought"))
+    if not out:
+        raise RuntimeError(f"empty model reply (native, finishReason={cands[0].get('finishReason') if cands else None})")
+    return out
+
+
 def call_model(model, messages, deadline):
     """Returns the message text or raises. Adapts once if the provider rejects JSON mode / reasoning_effort."""
     gemma = is_gemma(model)
+    if gemma and NATIVE_GEMMA and GOOGLE_HOST in LLM_URL:
+        return call_native(model, messages, deadline)
     if gemma:   # fold the system prompt into the user turn: works whether or not the endpoint accepts system roles
         messages = [{"role": "user", "content": messages[0]["content"] + "\n\n" + messages[1]["content"]}] + messages[2:]
     json_mode, effort = not gemma, (not gemma and model.startswith("gemini"))
@@ -309,32 +332,23 @@ def planner(body, accept=None, deadline=None):
 # ---------------------------------------------------------------- model scan (for /scanmodels)
 CANDIDATES = ["gemma-4-26b-a4b-it", "gemma-4-31b-it", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 _FILLER = "\n".join(f"[ev_{i:05d}] 2026-05-03T00:00:00Z Routine heartbeat recovered on its next interval and served no production requests."
-                    for i in range(120))                                   # about 3,000 tokens, like one compacted transcript
+                    for i in range(20))                                    # small, like one filtered evidence prompt
 _SCAN_PROMPT = _FILLER + '\n\nIgnore the log above. Reply with JSON only: {"ok": true}'
 
 
 def _one(model):
+    """Same call path the planner uses (native API for Gemma), so a green result here means planning will work."""
     t = time.time()
+    msgs = [{"role": "system", "content": "Reply with JSON only."},
+            {"role": "user", "content": _SCAN_PROMPT}]
     try:
-        r = httpx.post(LLM_URL, headers={"Authorization": f"Bearer {TOKEN}"},
-                       json={"model": model, "messages": [{"role": "user", "content": _SCAN_PROMPT}]}, timeout=40)
+        text = call_model(model, msgs, time.monotonic() + 30)
+        ok = "{" in text
+        return {"model": model, "status": 200, "seconds": round(time.time() - t, 1),
+                "path": "native" if (is_gemma(model) and NATIVE_GEMMA and GOOGLE_HOST in LLM_URL) else "openai-compatible",
+                "message": ("ok: " if ok else "replied without JSON: ") + " ".join(text.split())[:80]}
     except Exception as exc:
-        return {"model": model, "status": 0, "seconds": round(time.time() - t, 1), "message": repr(exc)[:200]}
-    msg = "ok"
-    if r.status_code != 200:
-        try:
-            j = r.json()
-            j = j[0] if isinstance(j, list) else j
-            msg = j["error"]["message"]
-        except Exception:
-            msg = r.text
-        msg = " ".join(str(msg).split())[:220]
-    else:
-        try:
-            msg = f"ok (prompt tokens: {r.json().get('usage', {}).get('prompt_tokens')})"
-        except Exception:
-            pass
-    return {"model": model, "status": r.status_code, "seconds": round(time.time() - t, 1), "message": msg}
+        return {"model": model, "status": 0, "seconds": round(time.time() - t, 1), "message": str(exc)[:240]}
 
 
 def scan(models_=None, burst=None):
