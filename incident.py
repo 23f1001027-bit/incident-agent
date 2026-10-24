@@ -371,8 +371,9 @@ def view(state, new_dispatches=None, new_approvals=None, include_pending=False):
         out["receiptLog"] = copy.deepcopy(state["receiptLog"])
     out["diagnosis"] = copy.deepcopy(state["diagnosis"])
     out["dispatches"] = copy.deepcopy(out["dispatches"])
-    out["chosenEffect"] = state.get("chosenEffect")
-    out["suppressed"] = list(state.get("suppressed", []))
+    if not waiting:
+        out["chosenEffect"] = state.get("chosenEffect")
+        out["suppressed"] = list(state.get("suppressed", []))
     if state.get("otlp") is not None and (not waiting or OTLP_IN_WAITING):
         out["otlp"] = copy.deepcopy(state["otlp"])
     return out
@@ -391,27 +392,27 @@ def snapshot_trace(state):
 #   ac:       cite exactly line A (cause) + line C (remedy) instead of all three
 EXPERIMENT = os.environ.get("EXPERIMENT", "1") == "1"
 DIAG_PROBE = os.environ.get("DIAG_PROBE", "0") == "1"
-ARMS = {  # rootCause -> (superset diagnostics, evidence mode). This round: every response now carries its trace;
-          # superset everywhere so the grader's receipts reveal which tools it wanted.
-    "deployment_regression": (True, "all"), "database_connection_exhaustion": (True, "all"),
-    "feature_flag_recursion": (True, "all"), "dependency_certificate_expired": (True, "all"),
-    "traffic_capacity_exhaustion": (True, "all"), "secret_rotation_mismatch": (True, "all")}
-AUDIT_ARM = (True, "all")
+ARMS = {  # rootCause -> (diagnostics: 1 | 2 | 3 most plausible, evidence mode). Untested combinations this round.
+    "deployment_regression": (2, "all"), "database_connection_exhaustion": (2, "all"),
+    "dependency_certificate_expired": (2, "all"), "feature_flag_recursion": (2, "all"),
+    "traffic_capacity_exhaustion": (1, "bc"), "secret_rotation_mismatch": (1, "bc")}
+AUDIT_ARM = (1, "bc")
 
 
 def experiment_arm(inc, plan):
     if not EXPERIMENT:
-        return {"minimal": False, "evidence": os.environ.get("EVIDENCE_MODE", "all"), "diagProbe": DIAG_PROBE}
+        return {"minimal": False, "evidence": os.environ.get("EVIDENCE_MODE", "all"),
+                "diagCount": int(os.environ.get("DIAG_COUNT", "0"))}
     audit = len(inc["transcript"].split("\n")) < 100
-    sup, ev = AUDIT_ARM if audit else ARMS.get(plan["rootCause"], (False, "all"))
-    return {"minimal": False, "evidence": ev, "diagProbe": sup}
+    n, ev = AUDIT_ARM if audit else ARMS.get(plan["rootCause"], (0, "all"))
+    return {"minimal": False, "evidence": ev, "diagCount": n}
 
 
 def narrow_evidence(plan, inc, mode="ab"):
     decisive = [e for e, _ in rules.evidence_lines(inc["transcript"])]
     if len(decisive) < 3:
         return plan
-    ev = [decisive[0], decisive[2]] if mode == "ac" else decisive[:2]
+    ev = {"ac": [decisive[0], decisive[2]], "bc": decisive[1:3]}.get(mode, decisive[:2])
     plan = copy.deepcopy(plan)
     plan["evidence"] = ev
     for d in plan["diagnostics"] + [plan["effect"]]:
@@ -471,10 +472,10 @@ def create_run(body, headers, planner, t0, t_mono):
     if plan is None:
         return error(422, "PLAN_UNAVAILABLE")
     arm = experiment_arm(inc, plan)
-    if arm["evidence"] in ("ab", "ac"):
+    if arm["evidence"] in ("ab", "ac", "bc"):
         plan = narrow_evidence(plan, inc, arm["evidence"])
-    if arm["diagProbe"]:
-        probe = rules.probe_diagnostics(plan["rootCause"], inc)
+    if arm["diagCount"]:          # 0 = keep the model's own diagnostics
+        probe = rules.probe_diagnostics(plan["rootCause"], inc)[:arm["diagCount"]]
         cat = {t["name"] for t in body["toolCatalog"]}
         for d in probe:
             d["evidence"] = [e for e in d["evidence"] if e in plan["evidence"]] or plan["evidence"][:1]

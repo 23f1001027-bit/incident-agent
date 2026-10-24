@@ -80,8 +80,44 @@ def _facts(transcript):
             "atLimit": bool(AT_LIMIT_RE.search(text)) or bool(reps and cur and cur[0] >= reps[0]) or kv_limit}
 
 
+def _kv(text, pat):
+    return [int(x) for x in re.findall(pat, text, re.I)]
+
+
+@functools.lru_cache(maxsize=64)
+def _policy(transcript):
+    """None when no explicit policy line exists; otherwise whether the stated conditions allow the operator's change."""
+    text = "\n".join(t for _, t in evidence_lines(transcript))
+    if not re.search(r"otherwise page the owner|policy:", text, re.I):
+        return None, None
+    frz = _kv(text, r"freeze\s*=\s*(\d+)")
+    dlg = _kv(text, r"delegation\s*=\s*(\d+)")
+    rem = _kv(text, r"remaining (?:permitted )?changes\s*=\s*(\d+)")
+    mx = _kv(text, r"(?:contract|permitted|replica) maximum\s*=\s*(\d+)")
+    tgt = _kv(text, r"proposed target\s*=\s*(\d+)")
+    ok = True
+    if frz and frz[0] != 0:
+        ok = False
+    if dlg and dlg[0] != 1:
+        ok = False
+    if rem and rem[0] <= 0:
+        ok = False
+    if mx and tgt and tgt[0] > mx[0]:
+        ok = False
+    return ok, (tgt[0] if tgt else None)
+
+
 def facts(transcript):
-    return dict(_facts(transcript))
+    f = dict(_facts(transcript))
+    allowed, tgt = _policy(transcript)
+    f["policyAllows"] = allowed
+    if tgt and not f["targetReplicas"]:
+        f["targetReplicas"] = tgt
+    if allowed is False:
+        f["atLimit"] = True
+    elif allowed is True:
+        f["atLimit"] = False
+    return f
 
 
 # ---------------------------------------------------------------- repair a model plan
@@ -109,8 +145,18 @@ def repair(plan, inc):
     for d in plan["diagnostics"]:
         d["arguments"] = fix(d["toolName"], d["arguments"])
     e = plan["effect"]
+    cause = plan.get("rootCause")
     if e["toolName"] == "scale_service" and f["atLimit"]:      # already at the permitted limit: page, never scale
         e["toolName"], e["arguments"] = "page_owner", {"service": svc, "severity": sev}
+    if f["policyAllows"] is False and e["toolName"] in ("scale_service", "rollback_deployment", "disable_feature"):
+        e["toolName"], e["arguments"] = "page_owner", {"service": svc, "severity": sev}
+    if f["policyAllows"] is True and e["toolName"] == "page_owner":   # the stated policy permits the change itself
+        if cause in ("traffic_capacity_exhaustion", "database_connection_exhaustion") and f["targetReplicas"]:
+            e["toolName"], e["arguments"] = "scale_service", {"service": svc, "targetReplicas": f["targetReplicas"]}
+        elif cause == "feature_flag_recursion" and f["flags"]:
+            e["toolName"], e["arguments"] = "disable_feature", {"service": svc, "flag": f["flags"][0]}
+        elif cause == "deployment_regression" and f["goodReleases"]:
+            e["toolName"], e["arguments"] = "rollback_deployment", {"service": svc, "release": f["goodReleases"][0]}
     e["arguments"] = fix(e["toolName"], e["arguments"])
     return plan
 
@@ -141,7 +187,8 @@ def rule_plan(body):
     diag, eff = [], None
     if cause == "deployment_regression":
         diag = [("inspect_deployment", {"service": svc}, cite(r"release"))]
-        eff = ("rollback_deployment", {"service": svc, "release": (f["goodReleases"] or f["releases"] or [""])[0]})
+        eff = ("page_owner", {"service": svc, "severity": sev}) if f["policyAllows"] is False else \
+            ("rollback_deployment", {"service": svc, "release": (f["goodReleases"] or f["releases"] or [""])[0]})
     elif cause == "database_connection_exhaustion":
         diag = [("query_metrics", {"service": svc, "metric": "db_connection_pool_wait", "windowMinutes": 60}, cite(r"pool"))]
         eff = ("page_owner", {"service": svc, "severity": sev}) if f["atLimit"] or not f["targetReplicas"] else \
@@ -157,7 +204,8 @@ def rule_plan(body):
     elif cause == "feature_flag_recursion":
         flag = (f["flags"] or [""])[0]
         diag = [("query_logs", {"service": svc, "query": flag, "windowMinutes": 60}, cite(r"flag"))]
-        eff = ("disable_feature", {"service": svc, "flag": flag})
+        eff = ("page_owner", {"service": svc, "severity": sev}) if f["policyAllows"] is False else \
+            ("disable_feature", {"service": svc, "flag": flag})
     elif cause == "secret_rotation_mismatch":
         if re.search(r"runbook", text):
             diag = [("read_runbook", {"service": svc, "topic": "secret_rotation"}, cite(r"runbook"))]
