@@ -81,6 +81,29 @@ def sensitive_values(body):
     return sorted(vals - names, key=len, reverse=True)
 
 
+# ---------------------------------------------------------------- debug recorder (GET /debug/dump)
+DEBUG_ON = os.environ.get("DEBUG_DUMP", "1") == "1"
+DEBUG = {"runs": {}, "events": []}
+_dbg_lock = threading.Lock()
+_run_secrets = {}                       # runId -> sensitive values, memory only, used to scrub debug records
+
+
+def dbg_run(run_id, **kw):
+    if DEBUG_ON:
+        with _dbg_lock:
+            DEBUG["runs"].setdefault(run_id, {}).update(scrub(kw, _run_secrets.get(run_id, [])))
+            while len(DEBUG["runs"]) > 30:
+                DEBUG["runs"].pop(next(iter(DEBUG["runs"])))
+
+
+def dbg_event(run_id, **kw):
+    if DEBUG_ON:
+        with _dbg_lock:
+            DEBUG["events"].append(scrub({"t": round(time.time(), 3), "runId": run_id, **kw},
+                                         _run_secrets.get(run_id, [])))
+            del DEBUG["events"][:-500]
+
+
 # ---------------------------------------------------------------- storage
 class Store:
     def __init__(self, path):
@@ -341,10 +364,21 @@ def view(state, new_dispatches=None, new_approvals=None, include_pending=False):
 
 
 # ---------------------------------------------------------------- create run
+def find_trace_context(headers, body):
+    if headers.get("traceparent"):
+        return headers, "header"
+    if isinstance(body.get("traceparent"), str):
+        return body, "body"
+    for k, v in body.items():
+        if k not in ("sensitive", "incident") and isinstance(v, dict) and isinstance(v.get("traceparent"), str):
+            return v, "body." + k
+    return {}, "none"
+
+
 def create_run(body, headers, planner, t0, t_mono):
     run_id = body["runId"]
     inc = body["incident"]
-    tp_src = headers if headers.get("traceparent") else body          # header first, then a body field
+    tp_src, where = find_trace_context(headers, body)
     incoming = parse_traceparent(tp_src.get("traceparent") if isinstance(tp_src.get("traceparent"), str) else None)
     trace = {"traceId": incoming[0] if incoming else hexid(32), "serverSpanId": hexid(16),
              "agentSpanId": hexid(16), "chatSpanId": hexid(16), "joinSpanId": hexid(16), "gateSpanId": hexid(16)}
@@ -355,6 +389,15 @@ def create_run(body, headers, planner, t0, t_mono):
         if ts:
             trace["tracestate"] = ts
 
+    _run_secrets[run_id] = sensitive_values(body)
+    import planner as pm
+    dbg_run(run_id, bodyKeys=sorted(body), headerNames=sorted(headers), traceSource=where,
+            traceparent=tp_src.get("traceparent"), tracestate=tp_src.get("tracestate"),
+            incident={k: inc.get(k) for k in ("incidentId", "title", "service", "severity", "allowedRootCauses")},
+            transcript=pm.compact(inc["transcript"], str(inc.get("service") or ""), ",".join(map(str, inc["allowedRootCauses"]))),
+            transcriptLines=len(inc["transcript"].split("\n")),
+            toolCatalog=body["toolCatalog"], policy={k: v for k, v in body["policy"].items() if k != "doNotExport"},
+            extra={k: body[k] for k in body if k not in ("sensitive", "incident", "toolCatalog", "policy")})
     log_sample(body)
     plan_start = time.time_ns()
     plan, model = None, os.environ.get("LLM_MODEL", "gemma-4-26b-a4b-it")
@@ -404,6 +447,8 @@ def create_run(body, headers, planner, t0, t_mono):
     resp = view(state, new_dispatches=new, new_approvals=[])
     state["firstResponse"] = resp
     STORE.save(state)
+    dbg_run(run_id, model=model, fallback=used_fallback, planSeconds=round((plan_end - plan_start) / 1e9, 1),
+            plan=plan, firstResponse=resp)
     return reply(200, resp)
 
 
@@ -540,11 +585,17 @@ def receipts_route(run_id, body_bytes):
         state = copy.deepcopy(state)               # work on a copy: a rejected receipt changes nothing
         try:
             new_d, new_a = process_receipt(state, body, time.time_ns())
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError) as exc:
+            print(f"RECEIPT {run_id[:14]} {rid[:16]} rejected 422: {exc!r}", flush=True)
+            dbg_event(run_id, kind="receipt", status=422, reason=repr(exc), receipt=body)
             return error(422, "INVALID_STATE")
         resp = view(state, new_dispatches=new_d, new_approvals=new_a)
         state["receipts"][rid] = {"hash": h, "response": resp}
         STORE.save(state)
+        print(f"RECEIPT {run_id[:14]} {rid[:16]} -> {state['status']} dispatches={[(d['toolName'], d['attempt']) for d in new_d]} "
+              f"approvals={[a['toolName'] for a in new_a]}", flush=True)
+        dbg_event(run_id, kind="receipt", status=200, receipt=body, runStatus=state["status"],
+                  newDispatches=new_d, newApprovals=new_a)
         return reply(200, resp)
 
 
@@ -743,7 +794,25 @@ def selftest(planner, n=1):
 
 # ---------------------------------------------------------------- router
 def handle(method, path, headers, body, planner, query=None):
+    status, h, payload = _handle(method, path, headers, body, planner, query)
+    if DEBUG_ON and "/v2/" in path:
+        m = re.match(r"/v2/incidents/([^/]+)", path)
+        code = None
+        if status >= 400:
+            try:
+                code = json.loads(payload)["error"]["code"]
+            except Exception:
+                pass
+        dbg_event(m.group(1) if m else None, kind="request", method=method, path=path, status=status, error=code,
+                  bytes=len(payload))
+    return status, h, payload
+
+
+def _handle(method, path, headers, body, planner, query=None):
     headers = {k.lower(): v for k, v in headers.items()}
+    if DEBUG_ON and method == "GET" and path.rstrip("/") == "/debug/dump":
+        with _dbg_lock:
+            return reply(200, DEBUG)
     path = re.sub(r"/{2,}", "/", path).rstrip("/") or "/"
     if method == "GET" and path in ("/healthz", "/"):
         return reply(200, {"status": "ok"})

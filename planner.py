@@ -38,7 +38,7 @@ LLM_MODEL = norm_model(env("LLM_MODEL", "gemma-4-26b-a4b-it"))
 FALLBACK_MODELS = [norm_model(m) for m in env("LLM_FALLBACK_MODELS", "gemma-4-31b-it").split(",") if m.strip()]
 TOKEN = env("LLM_TOKEN") or env("AIPIPE_TOKEN")
 PLAN_BUDGET = float(env("PLAN_BUDGET", "13"))        # seconds for the whole planning step (grader allows 18 per request)
-HEDGE_AFTER = float(env("HEDGE_AFTER", "6"))         # start the next model if the current one is silent this long
+HEDGE_AFTER = float(env("HEDGE_AFTER", "4"))         # start the next model if the current one is silent this long
 MODEL_TPM = int(env("MODEL_TPM", "14000"))           # assumed free-tier tokens/minute per model, used to spread bursts
 MAX_PROMPT_CHARS = int(env("MAX_PROMPT_CHARS", "16000"))
 
