@@ -16,6 +16,7 @@ import time
 PROFILE = "ga5-incident-agent/v2"
 DB_PATH = os.environ.get("DB_PATH", "/tmp/incident_agent.db")
 MAX_BODY = 700 * 1024
+PLAN_BUDGET = float(os.environ.get("PLAN_BUDGET", "13"))   # seconds from request arrival to a stored plan
 TERMINAL = {"completed", "failed"}
 TP_RE = re.compile(r"^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$")
 EV_RE = re.compile(r"^\s*\[([^\]\s]{3,80})\]", re.M)
@@ -96,6 +97,18 @@ class Store:
             print("storage warning, in-memory only:", repr(exc), flush=True)
             self.db = None
 
+    def get(self, run_id):
+        """Read-through: another worker process may have created or advanced the run."""
+        with self.lock:
+            if self.db is not None:
+                try:
+                    row = self.db.execute("select body from runs where run_id=?", (run_id,)).fetchone()
+                    if row:
+                        self.runs[run_id] = json.loads(row[0])
+                except Exception as exc:
+                    print("db read failed:", repr(exc), flush=True)
+            return self.runs.get(run_id)
+
     def save(self, state):
         with self.lock:
             self.runs[state["runId"]] = state
@@ -148,6 +161,9 @@ def check_schema(args, schema):
         if props and k not in props and schema.get("additionalProperties") is False:
             continue
         spec = props.get(k) or {}
+        if spec.get("type") is None and isinstance(v, str) and re.fullmatch(r"\d+", v.strip()) \
+                and re.search(r"(Minutes|Replicas|Count|Seconds|Hours|Limit)$", k):
+            v = int(v)                          # untyped schema: counts/durations are integers
         if not type_ok(spec.get("type"), v):
             # tolerate numbers sent as strings, and the reverse
             if spec.get("type") in ("integer", "number") and isinstance(v, str):
@@ -166,6 +182,15 @@ def check_schema(args, schema):
         if k not in out:
             return None
     return out
+
+
+def fix_service(args, inc):
+    svc = inc.get("service")
+    v = args.get("service")
+    if isinstance(svc, str) and svc and "service" in args and (not isinstance(v, str) or v not in inc.get("transcript", "")
+                                                              and v not in (inc.get("title") or "")):
+        args["service"] = svc
+    return args
 
 
 def ev_ids(transcript):
@@ -198,6 +223,7 @@ def validate_plan(raw, body):
             args = check_schema(d.get("arguments", {}), catalog[name].get("inputSchema"))
             if args is None:
                 continue
+            args = fix_service(args, inc)
             key = (name, canon(args))
             if key in seen:
                 continue
@@ -213,6 +239,7 @@ def validate_plan(raw, body):
         eargs = check_schema(eff.get("arguments", {}), catalog[eff["toolName"]].get("inputSchema"))
         if eargs is None:
             return None, "effect.arguments do not match the tool inputSchema"
+        eargs = fix_service(eargs, inc)
         ecite = [e for e in dict.fromkeys(str(x).strip("[] ") for x in eff.get("evidence") or []) if e in ev] or ev[:1]
         return {"rootCause": raw["rootCause"], "evidence": ev, "diagnostics": diags,
                 "effect": {"toolName": eff["toolName"], "arguments": eargs, "evidence": ecite}}, None
@@ -236,7 +263,10 @@ def fallback_plan(body):
     eff = "page_owner" if "page_owner" in effect_tools else (effect_tools[0] if effect_tools else None)
     if len(ev) < 2 or not diag_name or not eff:
         return None
-    return {"rootCause": inc["allowedRootCauses"][0], "evidence": ev,
+    text = inc["transcript"].lower()
+    cause = max(inc["allowedRootCauses"],
+                key=lambda c: sum(text.count(w) for w in str(c).lower().split("_") if len(w) > 3))
+    return {"rootCause": cause, "evidence": ev,
             "diagnostics": [{"toolName": diag_name, "arguments": fill(catalog[diag_name].get("inputSchema")), "evidence": ev[:1]}],
             "effect": {"toolName": eff, "arguments": fill(catalog[eff].get("inputSchema")), "evidence": ev[:1]}}
 
@@ -311,43 +341,32 @@ def view(state, new_dispatches=None, new_approvals=None, include_pending=False):
 
 
 # ---------------------------------------------------------------- create run
-def create_run(body, headers, planner):
-    t0 = time.time_ns()
+def create_run(body, headers, planner, t0, t_mono):
     run_id = body["runId"]
     inc = body["incident"]
-    incoming = parse_traceparent(headers.get("traceparent"))
+    tp_src = headers if headers.get("traceparent") else body          # header first, then a body field
+    incoming = parse_traceparent(tp_src.get("traceparent") if isinstance(tp_src.get("traceparent"), str) else None)
     trace = {"traceId": incoming[0] if incoming else hexid(32), "serverSpanId": hexid(16),
              "agentSpanId": hexid(16), "chatSpanId": hexid(16), "joinSpanId": hexid(16), "gateSpanId": hexid(16)}
     if incoming:
         trace["parentSpanId"] = incoming[1]
-        ts = (headers.get("tracestate") or "").strip()
+        ts = tp_src.get("tracestate")
+        ts = ts.strip() if isinstance(ts, str) else ""
         if ts:
             trace["tracestate"] = ts
 
     log_sample(body)
     plan_start = time.time_ns()
-    raw, model = None, os.environ.get("LLM_MODEL", "gpt-4.1")
-    reason, t_first = "planner failed", time.time()
+    plan, model = None, os.environ.get("LLM_MODEL", "gemma-4-26b-a4b-it")
     try:
-        raw, model = planner(body)
+        # one logical chat step with one hard deadline, measured from when the request arrived
+        plan, model = planner(body, accept=lambda raw: validate_plan(raw, body), deadline=t_mono + PLAN_BUDGET)
     except Exception as exc:
-        print("planner error:", repr(exc), flush=True)
-    plan = None
-    if raw:
-        plan, reason = validate_plan(raw, body)
-        if plan is None and time.time() - t_first < 7:          # one corrective retry, same logical chat step
-            try:
-                raw2, model = planner(body, reason)
-                plan, reason = validate_plan(raw2, body)
-                raw = raw2
-            except Exception as exc:
-                print("planner retry error:", repr(exc), flush=True)
+        print("planner error:", str(exc)[:1500], flush=True)
     plan_end = time.time_ns()
     used_fallback = plan is None
     if used_fallback:
-        print(f"RUN {run_id[:14]} FALLBACK plan used. reason: {reason}", flush=True)
-        if raw:
-            print("RUN raw model plan:", json.dumps(raw, ensure_ascii=False)[:1500], flush=True)
+        print(f"RUN {run_id[:14]} FALLBACK plan used", flush=True)
         plan = fallback_plan(body)
     if plan is None:
         return error(422, "PLAN_UNAVAILABLE")
@@ -507,7 +526,7 @@ def receipts_route(run_id, body_bytes):
     except Exception:
         return error(400, "INVALID_REQUEST")
     with run_lock(run_id):
-        state = STORE.runs.get(run_id)
+        state = STORE.get(run_id)
         if state is None:
             return error(404, "NOT_FOUND")
         h = sha(canon(body))
@@ -518,11 +537,10 @@ def receipts_route(run_id, body_bytes):
             return reply(200, prior["response"])
         if state["status"] in TERMINAL:
             return error(422, "INVALID_STATE")
-        snapshot = copy.deepcopy(state)
+        state = copy.deepcopy(state)               # work on a copy: a rejected receipt changes nothing
         try:
             new_d, new_a = process_receipt(state, body, time.time_ns())
-        except ValueError:
-            STORE.runs[run_id] = snapshot          # nothing changed
+        except (ValueError, KeyError, TypeError):
             return error(422, "INVALID_STATE")
         resp = view(state, new_dispatches=new_d, new_approvals=new_a)
         state["receipts"][rid] = {"hash": h, "response": resp}
@@ -531,6 +549,7 @@ def receipts_route(run_id, body_bytes):
 
 
 def incidents_route(body_bytes, headers, planner):
+    t0, t_mono = time.time_ns(), time.monotonic()
     try:
         body = json.loads(body_bytes.decode("utf-8"))
         inc = body["incident"]
@@ -545,17 +564,17 @@ def incidents_route(body_bytes, headers, planner):
     if body.get("profile") != PROFILE:
         return error(400, "UNSUPPORTED_PROFILE")
     with run_lock(body["runId"]):
-        state = STORE.runs.get(body["runId"])
+        state = STORE.get(body["runId"])
         if state is not None:
             if state["reqHash"] != sha(canon(body)):
                 return error(409, "CONFLICT")
             return reply(200, state["firstResponse"])
-        return create_run(body, headers, planner)
+        return create_run(body, headers, planner, t0, t_mono)
 
 
 def get_route(run_id):
     with run_lock(run_id):
-        state = STORE.runs.get(run_id)
+        state = STORE.get(run_id)
         if state is None:
             return error(404, "NOT_FOUND")
         return reply(200, view(state, include_pending=True))
@@ -694,8 +713,9 @@ def selftest(planner, n=1):
         body = _synthetic_incident(f"selftest-{i}")
         t = time.time()
         try:
-            raw, model = planner(body)
-            plan, reason = validate_plan(raw, body)
+            reason = None
+            plan, model = planner(body, accept=lambda raw: validate_plan(raw, body),
+                                  deadline=time.monotonic() + PLAN_BUDGET)
             good = bool(plan and plan["rootCause"] == "deployment_regression"
                         and set(plan["evidence"]) <= {"ev_DEC001", "ev_DEC002", "ev_DEC003"}
                         and plan["effect"]["toolName"] == "rollback_deployment")
@@ -705,18 +725,15 @@ def selftest(planner, n=1):
                                             "diagnostics": [(d["toolName"], d["arguments"]) for d in plan["diagnostics"]],
                                             "effect": (plan["effect"]["toolName"], plan["effect"]["arguments"])}}
         except Exception as exc:
-            results[i] = {"seconds": round(time.time() - t, 1), "error": repr(exc)[:500]}
+            results[i] = {"seconds": round(time.time() - t, 1), "error": str(exc)[:800]}
 
     threads = [threading.Thread(target=one, args=(i,)) for i in range(n)]
     [t.start() for t in threads]
     [t.join() for t in threads]
-    url = os.environ.get("LLM_URL", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+    import planner as pm
     return reply(200, {
-        "config": {"llmHost": url.split("/")[2], "llmPath": "/" + "/".join(url.split("/")[3:]),
-                   "model": os.environ.get("LLM_MODEL", "(default)"),
-                   "effectiveUrl": getattr(__import__("planner"), "LLM_URL", None) if "planner" in __import__("sys").modules else None,
-                   "effectiveModel": getattr(__import__("planner"), "LLM_MODEL", None) if "planner" in __import__("sys").modules else None,
-                   "tokenSet": bool(os.environ.get("LLM_TOKEN") or os.environ.get("AIPIPE_TOKEN"))},
+        "config": {"llmUrl": pm.LLM_URL, "modelOrder": pm.models(), "planBudget": PLAN_BUDGET,
+                   "tokenSet": bool(pm.TOKEN)},
         "summary": {"calls": n, "succeeded": sum(1 for r in results if r and "error" not in r),
                     "validPlans": sum(1 for r in results if r and r.get("valid")),
                     "looksRight": sum(1 for r in results if r and r.get("looksRight")),
