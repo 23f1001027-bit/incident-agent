@@ -18,6 +18,7 @@ import rules
 PROFILE = "ga5-incident-agent/v2"
 DB_PATH = os.environ.get("DB_PATH", "/tmp/incident_agent.db")
 MAX_BODY = 700 * 1024
+OTLP_IN_WAITING = os.environ.get("OTLP_IN_WAITING", "1") == "1"   # trace (incl. chat span) in every response
 PLAN_BUDGET = float(os.environ.get("PLAN_BUDGET", "7"))    # seconds from request arrival to a stored plan
 TERMINAL = {"completed", "failed"}
 TP_RE = re.compile(r"^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$")
@@ -370,11 +371,17 @@ def view(state, new_dispatches=None, new_approvals=None, include_pending=False):
         out["receiptLog"] = copy.deepcopy(state["receiptLog"])
     out["diagnosis"] = copy.deepcopy(state["diagnosis"])
     out["dispatches"] = copy.deepcopy(out["dispatches"])
-    if not waiting:
-        out["chosenEffect"] = state.get("chosenEffect")
-        out["suppressed"] = list(state.get("suppressed", []))
+    out["chosenEffect"] = state.get("chosenEffect")
+    out["suppressed"] = list(state.get("suppressed", []))
+    if state.get("otlp") is not None and (not waiting or OTLP_IN_WAITING):
         out["otlp"] = copy.deepcopy(state["otlp"])
     return out
+
+
+def snapshot_trace(state):
+    """Freeze the trace as of this transition, so stored responses and GET stay byte-identical."""
+    state["times"]["last"] = time.time_ns()
+    state["otlp"] = build_otlp(state)
 
 
 # ---------------------------------------------------------------- experiment arms (EXPERIMENT=1)
@@ -384,10 +391,11 @@ def view(state, new_dispatches=None, new_approvals=None, include_pending=False):
 #   ac:       cite exactly line A (cause) + line C (remedy) instead of all three
 EXPERIMENT = os.environ.get("EXPERIMENT", "1") == "1"
 DIAG_PROBE = os.environ.get("DIAG_PROBE", "0") == "1"
-ARMS = {  # rootCause -> (superset diagnostics, evidence mode)
+ARMS = {  # rootCause -> (superset diagnostics, evidence mode). This round: every response now carries its trace;
+          # superset everywhere so the grader's receipts reveal which tools it wanted.
     "deployment_regression": (True, "all"), "database_connection_exhaustion": (True, "all"),
-    "feature_flag_recursion": (True, "all"), "dependency_certificate_expired": (False, "ac"),
-    "traffic_capacity_exhaustion": (False, "ac"), "secret_rotation_mismatch": (True, "ac")}
+    "feature_flag_recursion": (True, "all"), "dependency_certificate_expired": (True, "all"),
+    "traffic_capacity_exhaustion": (True, "all"), "secret_rotation_mismatch": (True, "all")}
 AUDIT_ARM = (True, "all")
 
 
@@ -504,6 +512,7 @@ def create_run(body, headers, planner, t0, t_mono):
                            "toolName": eff["toolName"], "arguments": eff["arguments"], "evidence": eff["evidence"],
                            "execSpanId": hexid(16), "retried": False, "state": "planned", "attempt": 0}
     state["dispatchSecrets"] = None
+    snapshot_trace(state)
     resp = view(state, new_dispatches=new, new_approvals=[])
     state["firstResponse"] = resp
     STORE.save(state)
@@ -650,6 +659,8 @@ def receipts_route(run_id, body_bytes):
             print(f"RECEIPT {run_id[:14]} {rid[:16]} rejected 422: {exc!r}", flush=True)
             dbg_event(run_id, kind="receipt", status=422, reason=repr(exc), receipt=body)
             return error(422, "INVALID_STATE")
+        if state["status"] not in TERMINAL:
+            snapshot_trace(state)
         resp = view(state, new_dispatches=new_d, new_approvals=new_a)
         state["receipts"][rid] = {"hash": h, "response": resp}
         STORE.save(state)
@@ -704,7 +715,7 @@ def attr(k, v):
 def build_otlp(state):
     T, tid = state["trace"], state["trace"]["traceId"]
     times, base = state["times"], {"ga5.run.id": state["runId"], "ga5.public.marker": state["marker"]}
-    t_end = times.get("final", time.time_ns())
+    t_end = times.get("final") or times.get("last") or time.time_ns()
     spans = []
 
     def span(sid, parent, name, kind, start, end, attrs, status=None, links=None):
@@ -773,6 +784,9 @@ def build_otlp(state):
               "ga5.approval.receipt.nonce": ap["nonce"], "ga5.receipt.nonce": ap["nonce"],
               "ga5.receipt.id": ap["receiptId"], "ga5.action.id": ap["request"]["actionId"],
               "ga5.approval.decision": ap["decision"]})
+    elif ap:
+        span(T["gateSpanId"], T["agentSpanId"], "approval_gate", 1, times.get("approvalRequest", t_end), t_end,
+             {"ga5.approval.id": ap["request"]["approvalId"], "ga5.action.id": ap["request"]["actionId"]})
 
     return {"resourceSpans": [{"resource": {"attributes": [attr("service.name", "incident-agent")]},
                                "scopeSpans": [{"scope": {"name": "incident-agent"}, "spans": spans}]}]}

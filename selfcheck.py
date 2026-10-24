@@ -179,6 +179,10 @@ class Run:
         for k in ("actionLog", "receiptLog"):
             if not isinstance(r.get(k), list):
                 self.bad("correlation", f"waiting response lacks mandatory array {k}")
+        if "otlp" not in r:
+            self.bad("topology", "waiting response carries no trace (chat incident-plan span not visible)")
+        else:
+            self.check_trace(r, stage="first response: ")
         if r.get("status") != "waiting" or r.get("runId") != self.run_id:
             self.bad("proposal", "status/runId wrong")
         inc = self.body["incident"]
@@ -283,12 +287,13 @@ class Run:
                 [(a["receiptId"], a["approvalId"], a["decision"], a["nonce"]) for a in self.approval_receipts]:
             self.bad("correlation", "receiptLog approval entries do not match")
 
-    def check_trace(self, final):
+    def check_trace(self, final, stage=""):
         try:
             spans = final["otlp"]["resourceSpans"][0]["scopeSpans"][0]["spans"]
         except (KeyError, IndexError, TypeError):
-            self.bad("topology", "otlp missing")
+            self.bad("topology", stage + "otlp missing")
             return
+        before = {k: len(v) for k, v in self.problems.items()}
         A = lambda s: {a["key"]: list(a["value"].values())[0] for a in s.get("attributes", [])}
         by = {}
         for s in spans:
@@ -377,6 +382,9 @@ class Run:
         blob = json.dumps(final["otlp"])
         if any(c in blob for c in self.canaries) or self.body["incident"]["transcript"][:60] in blob:
             self.bad("redaction", "trace exports sensitive values or transcript text")
+        if stage:
+            for k, n in before.items():
+                self.problems[k][n:] = [stage + m for m in self.problems[k][n:]]
 
     def lifecycle_probes(self, final):
         s, again, _ = self.call("POST", "/v2/incidents", self.body, self.headers)
