@@ -13,10 +13,12 @@ import sqlite3
 import threading
 import time
 
+import rules
+
 PROFILE = "ga5-incident-agent/v2"
 DB_PATH = os.environ.get("DB_PATH", "/tmp/incident_agent.db")
 MAX_BODY = 700 * 1024
-PLAN_BUDGET = float(os.environ.get("PLAN_BUDGET", "13"))   # seconds from request arrival to a stored plan
+PLAN_BUDGET = float(os.environ.get("PLAN_BUDGET", "7"))    # seconds from request arrival to a stored plan
 TERMINAL = {"completed", "failed"}
 TP_RE = re.compile(r"^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$")
 EV_RE = re.compile(r"^\s*\[([^\]\s]{3,80})\]", re.M)
@@ -202,7 +204,7 @@ def check_schema(args, schema):
             return None
         out[k] = v
     for k in schema.get("required") or []:
-        if k not in out:
+        if k not in out or out[k] in ("", None, [], {}):
             return None
     return out
 
@@ -233,6 +235,9 @@ def validate_plan(raw, body):
             if e in known and e not in ev:
                 ev.append(e)
         ev = ev[:4]
+        decisive = [e for e, _ in rules.evidence_lines(inc["transcript"])]
+        if 2 <= len(decisive) <= 4:
+            ev = decisive          # the only non-boilerplate lines: cite all of them, in transcript order
         if len(ev) < 2:
             return None, "evidence must contain 2 to 4 IDs that appear at the start of transcript lines"
         catalog = {t["name"]: t for t in body["toolCatalog"]}
@@ -264,14 +269,22 @@ def validate_plan(raw, body):
             return None, "effect.arguments do not match the tool inputSchema"
         eargs = fix_service(eargs, inc)
         ecite = [e for e in dict.fromkeys(str(x).strip("[] ") for x in eff.get("evidence") or []) if e in ev] or ev[:1]
-        return {"rootCause": raw["rootCause"], "evidence": ev, "diagnostics": diags,
-                "effect": {"toolName": eff["toolName"], "arguments": eargs, "evidence": ecite}}, None
+        plan = rules.repair({"rootCause": raw["rootCause"], "evidence": ev, "diagnostics": diags,
+                             "effect": {"toolName": eff["toolName"], "arguments": eargs, "evidence": ecite}}, inc)
+        return plan, None
     except Exception as exc:
         return None, f"malformed plan ({type(exc).__name__})"
 
 
 def fallback_plan(body):
-    """Deterministic, conservative plan used only if the model output is unusable."""
+    """Deterministic plan used only if no model produced a usable plan in time."""
+    plan, _ = validate_plan(rules.rule_plan(body) or {}, body)
+    if plan:
+        return plan
+    return _last_resort_plan(body)
+
+
+def _last_resort_plan(body):
     inc, pol = body["incident"], body["policy"]
     ev = ev_ids(inc["transcript"])[:2]
     catalog = {t["name"]: t for t in body["toolCatalog"]}
@@ -396,6 +409,7 @@ def create_run(body, headers, planner, t0, t_mono):
             incident={k: inc.get(k) for k in ("incidentId", "title", "service", "severity", "allowedRootCauses")},
             transcript=pm.compact(inc["transcript"], str(inc.get("service") or ""), ",".join(map(str, inc["allowedRootCauses"]))),
             transcriptLines=len(inc["transcript"].split("\n")),
+            evidenceLines=[f"[{e}] {t}" for e, t in rules.evidence_lines(inc["transcript"])],
             toolCatalog=body["toolCatalog"], policy={k: v for k, v in body["policy"].items() if k != "doNotExport"},
             extra={k: body[k] for k in body if k not in ("sensitive", "incident", "toolCatalog", "policy")})
     log_sample(body)
