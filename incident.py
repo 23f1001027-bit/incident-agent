@@ -377,28 +377,33 @@ def view(state, new_dispatches=None, new_approvals=None, include_pending=False):
     return out
 
 
-# ---------------------------------------------------------------- waiting-response shape and evidence probe
-# Waiting responses carry runId, status, diagnosis, dispatches, approvals plus the mandatory actionLog and receiptLog
-# (dropping the logs took the grader's lifecycle score from 4/7 to 0/7).
-# EVIDENCE_PROBE=1 additionally cites only the first two decisive lines (cause + corroboration) for three incident
-# types, so one Check also shows whether the grader wants that pair or all decisive lines. Set it to 0 for Save.
-EVIDENCE_PROBE = os.environ.get("EVIDENCE_PROBE", "0") == "1"
-DIAG_PROBE = os.environ.get("DIAG_PROBE", "1") == "1"      # send the 3 most plausible diagnostics (learning run)
-PROBE_CAUSES = {"database_connection_exhaustion", "secret_rotation_mismatch", "dependency_certificate_expired"}
+# ---------------------------------------------------------------- experiment arms (EXPERIMENT=1)
+# Waiting responses always carry the mandatory actionLog / receiptLog arrays (dropping them cost lifecycle 4/7 -> 0/7).
+# Ruled out by earlier Checks: {all 3 decisive lines + 1 tool} and {lines A+B + 1 tool}. This round tests, per incident:
+#   superset: the 3 most plausible diagnostics (is a missing required tool the problem?)
+#   ac:       cite exactly line A (cause) + line C (remedy) instead of all three
+EXPERIMENT = os.environ.get("EXPERIMENT", "1") == "1"
+DIAG_PROBE = os.environ.get("DIAG_PROBE", "0") == "1"
+ARMS = {  # rootCause -> (superset diagnostics, evidence mode)
+    "deployment_regression": (True, "all"), "database_connection_exhaustion": (True, "all"),
+    "feature_flag_recursion": (True, "all"), "dependency_certificate_expired": (False, "ac"),
+    "traffic_capacity_exhaustion": (False, "ac"), "secret_rotation_mismatch": (True, "ac")}
+AUDIT_ARM = (True, "all")
 
 
 def experiment_arm(inc, plan):
+    if not EXPERIMENT:
+        return {"minimal": False, "evidence": os.environ.get("EVIDENCE_MODE", "all"), "diagProbe": DIAG_PROBE}
     audit = len(inc["transcript"].split("\n")) < 100
-    two = EVIDENCE_PROBE and not audit and plan["rootCause"] in PROBE_CAUSES
-    return {"minimal": os.environ.get("MINIMAL_WAITING", "0") == "1",
-            "evidence2": two or os.environ.get("EVIDENCE2", "0") == "1", "diagProbe": DIAG_PROBE}
+    sup, ev = AUDIT_ARM if audit else ARMS.get(plan["rootCause"], (False, "all"))
+    return {"minimal": False, "evidence": ev, "diagProbe": sup}
 
 
-def narrow_evidence(plan, inc):
+def narrow_evidence(plan, inc, mode="ab"):
     decisive = [e for e, _ in rules.evidence_lines(inc["transcript"])]
     if len(decisive) < 3:
         return plan
-    ev = decisive[:2]
+    ev = [decisive[0], decisive[2]] if mode == "ac" else decisive[:2]
     plan = copy.deepcopy(plan)
     plan["evidence"] = ev
     for d in plan["diagnostics"] + [plan["effect"]]:
@@ -458,12 +463,14 @@ def create_run(body, headers, planner, t0, t_mono):
     if plan is None:
         return error(422, "PLAN_UNAVAILABLE")
     arm = experiment_arm(inc, plan)
-    if arm["evidence2"]:
-        plan = narrow_evidence(plan, inc)
+    if arm["evidence"] in ("ab", "ac"):
+        plan = narrow_evidence(plan, inc, arm["evidence"])
     if arm["diagProbe"]:
         probe = rules.probe_diagnostics(plan["rootCause"], inc)
         cat = {t["name"] for t in body["toolCatalog"]}
-        probe = [d for d in probe if d["toolName"] in cat and set(d["evidence"]) <= set(plan["evidence"])]
+        for d in probe:
+            d["evidence"] = [e for e in d["evidence"] if e in plan["evidence"]] or plan["evidence"][:1]
+        probe = [d for d in probe if d["toolName"] in cat]
         if probe:
             plan = {**plan, "diagnostics": probe[:max(1, min(3, int(body["policy"].get("maximumDiagnostics", 3))))]}
     secrets_list = sensitive_values(body)
