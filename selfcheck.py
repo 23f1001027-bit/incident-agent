@@ -18,6 +18,24 @@ import selfcheck_cases as cases
 
 TP_RE = re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-01$")
 TOP = ["runId", "status", "diagnosis", "dispatches", "approvals"]
+
+
+def expected_diagnostics(cause, inc):
+    """The exact diagnostic calls the grader requires (course TA), written independently of rules.py."""
+    svc = inc.get("service")
+    deps = re.findall(r"\bdep_[a-z0-9]+", inc.get("transcript", ""))
+    m = lambda metric: ("query_metrics", {"service": svc, "metric": metric, "windowMinutes": 30})
+    q = lambda query: ("query_logs", {"service": svc, "query": query, "windowMinutes": 30})
+    rb = lambda topic: ("read_runbook", {"service": svc, "topic": topic})
+    insp = ("inspect_deployment", {"service": svc})
+    return {
+        "deployment_regression": [insp, m("error_rate")],
+        "database_connection_exhaustion": [m("db_pool_wait"), q("pool acquisition timeout")],
+        "dependency_certificate_expired": [("dependency_status", {"dependency": deps[0] if deps else None}), rb("tls-expiry")],
+        "feature_flag_recursion": [q("evaluation depth exceeded"), insp],
+        "traffic_capacity_exhaustion": [m("request_saturation")],
+        "secret_rotation_mismatch": [rb("secret-rotation")],
+    }.get(cause)
 DISPATCH = ["actionId", "callId", "phase", "toolName", "arguments", "evidence", "attempt", "traceparent"]
 INCOMING = ("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", "vendor=selfcheck")
 SCENARIO = {"deploy": "approval", "flag": "approval", "db": "happy", "cert": "happy", "traffic": "retry503",
@@ -200,6 +218,10 @@ class Run:
             self.bad("proposal", f"{len(ds)} diagnostic dispatches")
         if r.get("approvals") != []:
             self.bad("proposal", "approvals not empty in first response")
+        want_calls = expected_diagnostics(dg.get("rootCause"), inc)
+        got_calls = [(d.get("toolName"), d.get("arguments")) for d in ds]
+        if want_calls is not None and got_calls != want_calls:
+            self.bad("proposal", f"diagnostics {got_calls} != required {want_calls}")
         for d in ds:
             want = DISPATCH + (["tracestate"] if "tracestate" in d else [])
             if list(d) != want:
@@ -451,7 +473,7 @@ def run(handle, sequential=False):
                     "PROBLEMS FOUND: see 'problems' per incident"),
         "engineeringChecks": summary,
         "decisionsMatchingOurReading": f"{decisions_ok}/{len(runs)} (our reading of each case, NOT the grader's hidden key)",
-        "modelOrder": pm.models(), "diagProbe": __import__("incident").DIAG_PROBE,
+        "modelOrder": pm.models(),
         "mode": "sequential" if sequential else "parallel", "totalSeconds": round(time.time() - t0, 1),
         "incidents": reports,
     }

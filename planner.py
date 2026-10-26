@@ -170,13 +170,13 @@ The transcript was pre-filtered: boilerplate lines (forecasts, other services, u
 Return:
 1. rootCause: exactly ONE value from allowedRootCauses (copy it exactly).
 2. evidence: the 2 to 4 evidence IDs that establish the root cause (normally every line in evidenceLines).
-3. diagnostics: the MINIMUM read-only calls (tools NOT in policy.effectTools) that confirm the root cause; normally ONE call. Playbook:
-   deployment_regression -> inspect_deployment(service)
-   database_connection_exhaustion -> query_metrics(service, metric, windowMinutes)
-   traffic_capacity_exhaustion -> query_metrics(service, metric, windowMinutes)
-   dependency_certificate_expired -> dependency_status(dependency = the dep_... ID in the evidence)
-   feature_flag_recursion -> query_logs(service, query = the flag ID, windowMinutes)
-   secret_rotation_mismatch -> read_runbook(service, topic) when the evidence says the runbook is required first, else query_logs
+3. diagnostics: EXACTLY these read-only calls for the root cause, no extras (windowMinutes is always 30):
+   deployment_regression -> inspect_deployment(service) + query_metrics(service, metric="error_rate")
+   database_connection_exhaustion -> query_metrics(service, metric="db_pool_wait") + query_logs(service, query="pool acquisition timeout")
+   dependency_certificate_expired -> dependency_status(dependency = the dep_... ID in the evidence) + read_runbook(service, topic="tls-expiry")
+   feature_flag_recursion -> query_logs(service, query="evaluation depth exceeded") + inspect_deployment(service)
+   traffic_capacity_exhaustion -> query_metrics(service, metric="request_saturation") only
+   secret_rotation_mismatch -> read_runbook(service, topic="secret-rotation") only
    Each diagnostic cites at least one of your evidence IDs.
 4. effect: exactly ONE tool from policy.effectTools, with exact identifiers copied from the evidence:
    deployment_regression -> rollback_deployment(service, release = the previous / healthy / holdback release, NOT the bad one)
@@ -186,7 +186,7 @@ Return:
    secret_rotation_mismatch -> page_owner(service, severity)
    The evidence's own runbook/policy statements override this playbook.
 
-Arguments: service is the incident service ID exactly; severity is the incident severity exactly (e.g. SEV-1); integers for windowMinutes (e.g. 60) and targetReplicas; never leave a required argument empty.
+Arguments: service is the incident service ID exactly; severity is the incident severity exactly (e.g. SEV-1); integers for windowMinutes (always 30) and targetReplicas; never leave a required argument empty.
 
 Reply with ONE compact JSON object only, no markdown:
 {"rootCause":"...","evidence":["ev_..."],"diagnostics":[{"toolName":"...","arguments":{...},"evidence":["ev_..."]}],"effect":{"toolName":"...","arguments":{...},"evidence":["ev_..."]}}"""
