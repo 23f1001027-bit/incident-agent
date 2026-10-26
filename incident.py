@@ -446,6 +446,8 @@ def create_run(body, headers, planner, t0, t_mono):
         plan = {**plan, "diagnostics": required[:max(1, min(3, int(body["policy"].get("maximumDiagnostics", 3))))]}
     secrets_list = sensitive_values(body)
     plan = scrub(plan, secrets_list)                 # scrub BEFORE anything is logged or stored
+    print(f"EVIDENCE {run_id[:14]} lines={len(inc['transcript'].split(chr(10)))} " + json.dumps(scrub(
+        [f"[{e}] {t[:260]}" for e, t in rules.evidence_lines(inc["transcript"])], secrets_list), ensure_ascii=False), flush=True)
     print(f"RUN {run_id[:14]} plan={'FALLBACK' if used_fallback else 'model'} rootCause={plan['rootCause']} "
           f"evidence={plan['evidence']} diagnostics={[(d['toolName'], d['arguments']) for d in plan['diagnostics']]} "
           f"effect=({plan['effect']['toolName']}, {plan['effect']['arguments']})", flush=True)
@@ -533,10 +535,12 @@ def process_receipt(state, body, now):
     # ---- apply outcomes
     for o in outcomes or []:
         call = state["calls"].get(o["callId"]) or state["effectCall"]
-        entry = {"receiptId": receipt_id, "actionId": o["actionId"], "callId": o["callId"], "attempt": o["attempt"],
-                 "status": o["status"], "resultClass": o.get("resultClass"), "nonce": o["nonce"]}
-        if o.get("errorType"):
-            entry["errorType"] = o["errorType"]
+        # record the grader's outcome exactly as sent (no invented resultClass:null), tagged with its receiptId
+        entry = {"receiptId": receipt_id}
+        for k in ("actionId", "callId", "attempt", "status", "resultClass", "nonce"):
+            if k in o:
+                entry[k] = o[k]
+        entry.update({k: v for k, v in o.items() if k not in entry})
         state["receiptLog"].append(entry)
         state["times"][f"r:{o['callId']}:{o['attempt']}"] = now
         if 200 <= o["status"] < 300:
@@ -607,12 +611,14 @@ def receipts_route(run_id, body_bytes):
         state = STORE.get(run_id)
         if state is None:
             return error(404, "NOT_FOUND")
+        print(f"RECEIPT-IN {run_id[:14]} " + json.dumps(scrub(body, _run_secrets.get(run_id, [])), separators=(",", ":"))[:3000], flush=True)
         h = sha(canon(body))
         prior = state["receipts"].get(rid)
         if prior:
             if prior["hash"] != h:
                 return error(409, "CONFLICT")
-            return reply(200, prior["response"])
+            print(f"REPLAY receipt {run_id[:14]} {rid[:16]} status={state['status']}", flush=True)
+            return reply(200, replay_view(state, prior["response"]))
         if state["status"] in TERMINAL:
             return error(422, "INVALID_STATE")
         state = copy.deepcopy(state)               # work on a copy: a rejected receipt changes nothing
@@ -653,9 +659,17 @@ def incidents_route(body_bytes, headers, planner):
         state = STORE.get(body["runId"])
         if state is not None:
             if state["reqHash"] != sha(canon(body)):
+                print(f"CONFLICT incident {body['runId'][:14]}", flush=True)
                 return error(409, "CONFLICT")
-            return reply(200, state["firstResponse"])
+            print(f"REPLAY incident {body['runId'][:14]} status={state['status']}", flush=True)
+            return reply(200, replay_view(state, state["firstResponse"]))
         return create_run(body, headers, planner, t0, t_mono)
+
+
+def replay_view(state, stored):
+    """An exact replay reads stored state only. Once the run is final, every replay returns the stored
+    terminal state (byte-identical to GET); before that, the response originally sent for that request."""
+    return view(state, include_pending=True) if state["status"] in TERMINAL else stored
 
 
 def get_route(run_id):
